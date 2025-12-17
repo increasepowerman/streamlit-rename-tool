@@ -8,9 +8,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-import pandas as pd  # 新增：补全缺失的pandas导入（原代码用了但没导入）
-# 新增：导入上下文相关模块
-from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
+import pandas as pd  # 强制导入pandas
 
 # 页面配置
 st.set_page_config(
@@ -20,27 +18,25 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
-# 新增：强制自动打开浏览器（核心修复）
+# 修复：仅本地运行时自动打开浏览器
 def auto_open_browser(port=8501):
-    """启动后自动打开浏览器"""
-
+    """启动后自动打开浏览器（仅本地运行时生效）"""
+    if "STREAMLIT_SERVER_BASE_URL_PATH" in os.environ:
+        return  # Cloud环境跳过
     def open_browser():
-        time.sleep(2)  # 等待Streamlit服务启动
+        time.sleep(2)
         url = f"http://localhost:{port}"
         webbrowser.open_new(url)
-
-    # 启动子线程执行（避免阻塞Streamlit）
     thread = threading.Thread(target=open_browser, daemon=True)
     thread.start()
 
-
-# 新增：补全Streamlit上下文（消除警告核心）
+# 补全上下文（消除警告）
+from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
 ctx = get_script_run_ctx()
 if ctx:
     add_script_run_ctx(ctx)
 
-# 自定义样式美化
+# 自定义样式
 st.markdown("""
     <style>
     .stButton>button {
@@ -54,28 +50,18 @@ st.markdown("""
     .stButton>button:hover {
         background-color: #388E3C;
     }
-    .stTextInput>div>div>input {
-        border-radius: 6px;
-    }
-    .stAlert {
-        border-radius: 8px;
-    }
     .dataframe {
         border-radius: 8px;
         overflow: hidden;
         margin: 10px 0;
     }
-    .uploadedFile {
-        border-radius: 6px;
-    }
     </style>
 """, unsafe_allow_html=True)
 
-
-# 初始化会话状态（优化赋值逻辑，避免空值）
+# 初始化会话状态
 def init_session_state():
     default_state = {
-        "temp_dir": tempfile.mkdtemp(),
+        "temp_dir": "/tmp" if "STREAMLIT_SERVER_BASE_URL_PATH" in os.environ else tempfile.mkdtemp(),
         "original_files": [],
         "new_names": [],
         "renamed_folder": "",
@@ -84,39 +70,32 @@ def init_session_state():
     for key, value in default_state.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-
-# 执行初始化
 init_session_state()
 
-
-# ---------------- 核心工具函数 ----------------
+# ---------------- 核心工具函数（修复Cloud兼容） ----------------
 def copy_folder_to_temp(uploaded_files, temp_base_dir):
-    """将上传的文件夹（通过多文件上传模拟）复制到临时目录"""
-    # 创建原文件夹副本目录
-    copy_dir = os.path.join(temp_base_dir, f"原文件副本_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(copy_dir, exist_ok=True)
-
+    """修复：适配Cloud的临时目录权限"""
+    copy_dir = os.path.join(temp_base_dir, f"rename_copy_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(copy_dir, exist_ok=True, mode=0o777)  # 增加权限
+    
     file_list = []
     for file in uploaded_files:
-        # 保存上传的文件到副本目录
-        file_path = os.path.join(copy_dir, file.name)
+        # 修复：处理特殊字符文件名
+        safe_filename = os.path.basename(file.name).replace(" ", "_").replace("/", "_").replace("\\", "_")
+        file_path = os.path.join(copy_dir, safe_filename)
         with open(file_path, "wb") as f:
             f.write(file.getbuffer())
         file_list.append({
             "original_name": file.name,
             "original_path": file_path,
-            "new_name": file.name  # 默认新名称=原名称
+            "new_name": file.name
         })
-
     return copy_dir, file_list
 
-
 def batch_rename_files(file_list, copy_dir):
-    """批量重命名临时目录中的文件"""
+    """批量重命名（兼容Cloud）"""
     renamed_files = []
     fail_list = []
-    # 确保new_names长度匹配
     new_names = st.session_state.new_names + [f["original_name"] for f in file_list[len(st.session_state.new_names):]]
 
     for idx, file_info in enumerate(file_list):
@@ -124,23 +103,19 @@ def batch_rename_files(file_list, copy_dir):
         old_path = file_info["original_path"]
         new_name = new_names[idx].strip()
 
-        # 校验新名称
         if not new_name:
             fail_list.append(f"{old_name}：新名称不能为空")
             continue
 
-        # 分离后缀（自动保留）
         old_ext = Path(old_name).suffix
         new_name_full = new_name + old_ext if not new_name.endswith(old_ext) else new_name
-
-        # 避免重复文件名
-        new_path = os.path.join(copy_dir, new_name_full)
+        # 修复：Cloud路径拼接
+        new_path = os.path.join(copy_dir, new_name_full.replace(" ", "_"))
         suffix = 1
         while os.path.exists(new_path) and new_path != old_path:
             new_path = os.path.join(copy_dir, f"{Path(new_name).stem}_{suffix}{old_ext}")
             suffix += 1
 
-        # 执行重命名
         try:
             os.rename(old_path, new_path)
             renamed_files.append({
@@ -149,57 +124,49 @@ def batch_rename_files(file_list, copy_dir):
             })
         except Exception as e:
             fail_list.append(f"{old_name}：重命名失败 - {str(e)}")
-
     return renamed_files, fail_list
 
-
 def zip_folder(folder_path, zip_output_path):
-    """将文件夹打包为ZIP压缩包"""
+    """修复：Cloud压缩包权限"""
     with zipfile.ZipFile(zip_output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(folder_path):
             for file in files:
                 file_path = os.path.join(root, file)
-                # 保留文件夹结构
                 arcname = os.path.relpath(file_path, os.path.dirname(folder_path))
                 zipf.write(file_path, arcname)
 
-
 # ---------------- 网页界面 ----------------
-# 启动时自动打开浏览器
 auto_open_browser(port=8501)
 
 st.title("🔄 网页版批量文件重命名工具")
-st.caption("✅ 无需本地运行程序 | ✅ 复制原文件后重命名 | ✅ 下载重命名后的压缩包")
+st.caption("✅ Streamlit Cloud 兼容版 | ✅ 复制原文件后重命名 | ✅ 下载压缩包")
 st.divider()
 
-# 第一步：上传文件夹（通过多文件上传模拟，支持选择多个文件）
+# 第一步：上传文件
 st.subheader("📤 第一步：上传需要重命名的文件（可多选）")
 uploaded_files = st.file_uploader(
-    "选择需要改名的文件（支持多选，会自动复制为新文件夹）",
+    "选择需要改名的文件（支持多选）",
     accept_multiple_files=True,
-    help="注：网页无法直接访问本地文件夹，可多选文件上传（模拟文件夹）"
+    help="注：所有操作仅处理副本，不会修改本地原文件"
 )
 
 if uploaded_files and st.button("📁 复制文件到临时目录并加载"):
     with st.spinner("正在复制文件..."):
         copy_dir, file_list = copy_folder_to_temp(uploaded_files, st.session_state.temp_dir)
         st.session_state.original_files = file_list
-        st.session_state.new_names = [f["new_name"] for f in file_list]  # 确保长度匹配
+        st.session_state.new_names = [f["new_name"] for f in file_list]
         st.session_state.renamed_folder = copy_dir
-        st.success(f"✅ 成功复制 {len(file_list)} 个文件到临时目录：\n{copy_dir}")
-        st.session_state.zip_path = ""  # 清空旧压缩包
+        st.success(f"✅ 成功复制 {len(file_list)} 个文件到临时目录")
+        st.session_state.zip_path = ""
 
-# 第二步：编辑新文件名（表格形式）
+# 第二步：编辑新文件名
 if st.session_state.original_files:
     st.subheader("✏️ 第二步：编辑新文件名")
-    # 生成编辑表格的数据源
     table_data = {
         "序号": list(range(1, len(st.session_state.original_files) + 1)),
         "原文件名": [f["original_name"] for f in st.session_state.original_files],
         "新文件名": st.session_state.new_names
     }
-
-    # 展示可编辑的表格
     edited_df = st.data_editor(
         table_data,
         column_config={
@@ -210,12 +177,10 @@ if st.session_state.original_files:
         hide_index=True,
         key="name_editor"
     )
-
-    # 同步编辑后的新名称到会话状态（优化：仅当表格有数据时更新）
     if not edited_df.empty and len(edited_df["新文件名"]) == len(st.session_state.new_names):
         st.session_state.new_names = edited_df["新文件名"].tolist()
 
-    # 第三步：批量重命名
+    # 第三步：批量重命名+下载
     st.subheader("🚀 第三步：批量重命名并下载")
     col1, col2 = st.columns(2)
     with col1:
@@ -225,84 +190,55 @@ if st.session_state.original_files:
                     st.session_state.original_files,
                     st.session_state.renamed_folder
                 )
-                # 展示结果
                 if fail_list:
                     st.warning(f"⚠️ 重命名完成：成功 {len(renamed_files)} 个，失败 {len(fail_list)} 个")
                     st.text("失败详情：")
                     st.text("\n".join(fail_list))
                 else:
                     st.success(f"🎉 全部重命名成功！共修改 {len(renamed_files)} 个文件")
-
-                # 展示重命名对照表
                 if renamed_files:
-                    st.subheader("📋 重命名结果对照表")
+                    st.subheader("📋 重命名结果")
                     result_df = pd.DataFrame(renamed_files)
                     st.dataframe(result_df, hide_index=True)
 
-    # 第四步：打包并下载
     with col2:
         if st.session_state.renamed_folder and os.path.exists(st.session_state.renamed_folder):
-            # 生成压缩包
             if not st.session_state.zip_path or not os.path.exists(st.session_state.zip_path):
-                zip_filename = f"重命名后的文件_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                zip_filename = f"重命名文件_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
                 st.session_state.zip_path = os.path.join(st.session_state.temp_dir, zip_filename)
                 zip_folder(st.session_state.renamed_folder, st.session_state.zip_path)
-
-            # 提供下载按钮
             if os.path.exists(st.session_state.zip_path):
                 with open(st.session_state.zip_path, "rb") as f:
                     st.download_button(
-                        label="📥 下载重命名后的文件（ZIP压缩包）",
+                        label="📥 下载重命名后的文件（ZIP）",
                         data=f,
-                        file_name=os.path.basename(st.session_state.zip_path),
+                        file_name=zip_filename,
                         mime="application/zip"
                     )
             else:
-                st.warning("⚠️ 压缩包生成失败，请重新执行重命名")
+                st.warning("⚠️ 压缩包生成失败，请重试")
 
-# 清理临时文件（可选：页面刷新时清理）
+# 清理临时文件（适配Cloud）
 st.sidebar.subheader("🗑 清理临时文件")
 if st.sidebar.button("清空所有临时文件"):
     try:
-        # 递归删除临时目录
-        shutil.rmtree(st.session_state.temp_dir)
-        # 重建临时目录
-        st.session_state.temp_dir = tempfile.mkdtemp()
+        shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
+        st.session_state.temp_dir = "/tmp" if "STREAMLIT_SERVER_BASE_URL_PATH" in os.environ else tempfile.mkdtemp()
         st.session_state.original_files = []
         st.session_state.new_names = []
         st.session_state.renamed_folder = ""
         st.session_state.zip_path = ""
-        st.sidebar.success("✅ 已清空所有临时文件")
+        st.sidebar.success("✅ 已清空临时文件")
     except Exception as e:
         st.sidebar.error(f"❌ 清理失败：{str(e)}")
 
-# 操作提示
+# 使用说明
 st.sidebar.subheader("💡 使用说明")
 st.sidebar.markdown("""
-1. 点击「上传文件」选择需要重命名的文件（可多选）；
-2. 点击「复制文件到临时目录」，生成原文件的副本；
-3. 在表格中编辑「新文件名」列（无需输入后缀，自动保留）；
-4. 点击「执行批量重命名」，修改临时目录中的文件名称；
-5. 点击「下载压缩包」，获取重命名后的所有文件；
-6. 下载完成后可清空临时文件释放空间。
+1. 上传需要重命名的文件（可多选）；
+2. 点击「复制文件到临时目录」生成副本；
+3. 编辑「新文件名」列（无需输入后缀）；
+4. 执行重命名后下载压缩包；
+5. 完成后清空临时文件。
 """)
-
-# 安全提示
-st.sidebar.warning(
-    "⚠️ 注意：\n1. 所有操作仅针对上传的文件副本，不会修改本地原文件；\n2. 临时文件会保存在服务器（本地），建议及时清理；\n3. 请勿上传敏感/加密文件。")
-
-# 新增：主函数（兼容命令行启动）
-if __name__ == "__main__":
-    # 强制以Streamlit方式启动（关键！）
-    import subprocess
-    import sys
-
-    # 检查是否已通过streamlit run启动
-    if "streamlit" not in sys.argv[0]:
-        script_path = os.path.abspath(__file__)
-        # 执行streamlit run命令，并强制关闭无头模式
-        subprocess.call([
-            sys.executable, "-m", "streamlit", "run",
-            script_path, "--server.headless=false",
-            "--server.port=8501"
-        ])
+st.sidebar.warning("⚠️ 注：Cloud环境临时文件会在应用休眠后自动清理")
